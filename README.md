@@ -69,13 +69,6 @@ BiocManager::install(c("GenomicRanges", "IRanges", "ComplexUpset"))
 | File | Description |
 |---|---|
 | `process_focal_analysis_public.Rmd` | Public notebook — reproduces all figures from Zenodo data |
-| `process_focal_analysis_prepublic.Rmd` | Preprocessing notebook — aggregates protected data into public-ready files |
-| `process_focal_analysis_v11.Rmd` | Full analysis notebook (requires internal data access) |
-| `copy_data_for_zenodo.sh` | Copies raw data files to the public release directory |
-| `upload_to_zenodo.py` | Uploads files from the public directory to Zenodo |
-| `zenodo_env.yml` | Conda environment for the upload script |
-| `zenodo_description.txt` | Zenodo dataset description with file details |
-| `zenodo_data_inventory.md` | Internal inventory of all public release files |
 
 ## Data Overview
 
