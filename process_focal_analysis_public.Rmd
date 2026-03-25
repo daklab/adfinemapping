@@ -1,0 +1,1486 @@
+---
+title: "AD Fine-Mapping and Heritability Enrichment Analysis"
+subtitle: "Public Reproducible Notebook"
+output: html_document
+---
+
+This notebook reproduces all main and supplementary figures from the AD fine-mapping
+analysis using only public data files from the Zenodo release.
+
+Set `DATA_DIR` below to the directory where the Zenodo files were downloaded.
+All 32 files should be in a single flat directory (no subdirectories).
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(readr)
+library(patchwork)
+library(ggsci)
+library(ggrepel)
+library(scales)
+library(ComplexUpset)
+library(GenomicRanges)
+library(IRanges)
+library(PRROC)
+
+options(bitmapType = "cairo")                                                                                                                                                                           
+
+
+DATA_DIR <- "/gpfs/commons/groups/knowles_lab/ADSP_reguloML/adfinemapping_public"
+```
+
+## Theme and Colors
+
+```{r theme_setup}
+global_text_size <- 7
+
+theme_nature <- function(base_size = global_text_size,
+                        base_family = "Helvetica") {
+  theme_minimal(base_size = base_size, base_family = base_family) %+replace%
+    theme(
+      text = element_text(size = base_size, family = base_family, face = "plain"),
+      plot.title = element_text(size = base_size, face = "plain"),
+      plot.subtitle = element_text(size = base_size, face = "plain"),
+      axis.title = element_text(size = base_size, face = "plain"),
+      axis.text = element_text(size = base_size, face = "plain"),
+      legend.title = element_text(size = base_size, face = "plain"),
+      legend.text = element_text(size = base_size, face = "plain"),
+      strip.text = element_text(size = base_size, face = "plain")
+    )
+}
+
+npg_colors <- pal_npg()(7)
+
+colors_vec <- c(
+  'Baseline' = npg_colors[1],
+  "Roadmap" = npg_colors[2],
+  "Brain Omics" = npg_colors[3],
+  "DeepSea" = npg_colors[4],
+  'Enformer' = npg_colors[5],
+  'Enformer TF/Brain Omics' = npg_colors[6],
+  'SpliceAI/AlphaMissense' = npg_colors[7]
+)
+
+cohort_colors_vec <- c(
+  'SUSIE' = npg_colors[1],
+  "Baseline" = npg_colors[2],
+  "Baseline/Omics" = npg_colors[3],
+  "Baseline/Omics/DL" = npg_colors[4]
+)
+
+text_size <- 8
+```
+
+## Helper Functions
+
+```{r helper_functions}
+rename_strings_dataframe_exact <- function(input_df, column_name, mapping_df) {
+  column_name <- enquo(column_name)
+  input_df %>%
+    rowwise() %>%
+    mutate(
+      replacement_index = if_else(
+        any(mapping_df$Original == !!column_name),
+        which(mapping_df$Original == !!column_name)[1],
+        NA_integer_
+      )
+    ) %>%
+    ungroup() %>%
+    mutate(!!column_name := if_else(!is.na(replacement_index), mapping_df$Replacement[replacement_index], !!column_name)) %>%
+    select(-replacement_index)
+}
+
+annotate_peak_overlap <- function(variants_df, peak_df, col_name) {
+  variant_gr <- GRanges(
+    seqnames = paste0("chr", variants_df$CHR),
+    ranges = IRanges(start = variants_df$BP, width = 1)
+  )
+  peak_gr <- GRanges(
+    seqnames = peak_df$chrom,
+    ranges = IRanges(start = peak_df$start, end = peak_df$end)
+  )
+  overlaps <- overlapsAny(variant_gr, peak_gr)
+  variants_df[[col_name]] <- as.integer(overlaps)
+  return(variants_df)
+}
+
+get_top_enhancer_variant_matches <- function(variants_df, enhancer_df) {
+  result_df <- variants_df
+  result_df$enhancer_name <- NA
+  result_df$TargetGene <- NA
+  result_df$ABC.Score <- NA
+  for(i in seq_len(nrow(variants_df))) {
+    var <- variants_df[i,]
+    matches <- enhancer_df$chr == paste0("chr", var$CHR) &
+               enhancer_df$start <= var$BP &
+               enhancer_df$end >= var$BP
+    if(any(matches)) {
+      matching_enhancers <- enhancer_df[matches, ]
+      top_match <- matching_enhancers[which.max(matching_enhancers$ABC.Score), ]
+      result_df$enhancer_name[i] <- top_match$name
+      result_df$TargetGene[i] <- top_match$TargetGene
+      result_df$ABC.Score[i] <- top_match$ABC.Score
+    }
+  }
+  return(result_df)
+}
+
+get_top_placseq_variant_matches <- function(variants_df, enhancer_df, interaction_type_val) {
+  result_df <- variants_df
+  enhancer_df <- enhancer_df %>% dplyr::filter(interaction_type == interaction_type_val)
+  result_df$TargetGene <- NA
+  result_df$num_iteractions <- NA
+  for(i in seq_len(nrow(variants_df))) {
+    var <- variants_df[i,]
+    matches <- enhancer_df$chr == paste0("chr", var$CHR) &
+               enhancer_df$start <= var$BP &
+               enhancer_df$end >= var$BP
+    if(any(matches)) {
+      matching_enhancers <- enhancer_df[matches, ]
+      top_match <- matching_enhancers %>%
+        dplyr::select(gene_name) %>%
+        group_by(gene_name) %>%
+        summarise(num_overlaps = n()) %>% slice_max(num_overlaps, n = 1) %>%
+        ungroup()
+      result_df$TargetGene[i] <- top_match[1,]$gene_name
+      result_df$num_iteractions[i] <- top_match[1,]$num_overlaps
+    }
+  }
+  return(result_df)
+}
+
+make_auprc_plot_90_modified <- function(data, text_position = "bottom", title = NULL, text_size = 3) {
+  models <- unique(data$model)
+  results <- list()
+  baseline <- data %>%
+    group_by(PIP_filter) %>%
+    summarize(count = n()) %>%
+    mutate(prop = count / sum(count)) %>%
+    filter(PIP_filter == 'PIP>0.9') %>%
+    pull(prop)
+  for(m in models) {
+    subset_data <- data %>% filter(model == m)
+    pr <- PRROC::pr.curve(
+      scores.class0 = subset_data %>% filter(PIP_filter == 'PIP>0.9') %>% pull(score),
+      scores.class1 = subset_data %>% filter(PIP_filter == 'PIP<0.01') %>% pull(score),
+      curve = TRUE
+    )
+    optimal_idx <- which.max((2 * pr$curve[,1] * pr$curve[,2]) / (pr$curve[,1] + pr$curve[,2]))
+    results[[m]] <- data.frame(
+      recall = pr$curve[,1],
+      precision = pr$curve[,2],
+      model = m,
+      auprc = pr$auc.integral,
+      optimal_cutpoint = pr$curve[optimal_idx, 3]
+    )
+  }
+  plot_data <- bind_rows(results)
+  y_min <- min(plot_data$precision, baseline) * 0.9
+  y_max <- max(plot_data$precision) * 1.05
+  if(text_position == "top") {
+    y_range <- seq(0.9, 0.8, length.out = length(models))
+    x_pos <- 0.55
+  } else {
+    bottom_portion <- y_min + (y_max - y_min) * 0.25
+    y_range <- seq(bottom_portion, y_min + 0.05, length.out = length(models))
+    x_pos <- 0.1
+  }
+  text_data <- plot_data %>%
+    group_by(model) %>%
+    summarize(auprc = dplyr::first(auprc)) %>%
+    mutate(y_pos = y_range, baseline = baseline)
+  p <- ggplot(plot_data) +
+    geom_hline(yintercept = baseline, linetype = "dashed", color = "gray50") +
+    geom_line(aes(x = recall, y = precision, color = model)) +
+    theme_minimal() +
+    geom_text(data = text_data,
+              aes(x = x_pos, y = y_pos,
+                  label = sprintf("%s AUPRC: %.3f", model, auprc),
+                  color = model),
+              size = text_size, hjust = 0, fontface = "bold") +
+    annotate("text", x = 0.9, y = baseline + 0.02,
+             label = sprintf("Baseline: %.3f", baseline),
+             size = text_size - 0.5, hjust = 1, color = "gray50") +
+    ggsci::scale_color_npg() +
+    labs(color = "Model") +
+    theme(legend.position = "bottom") +
+    xlab('Recall') + ylab('Precision') +
+    theme(plot.margin = unit(c(0.5, 1.5, 0.5, 0.5), "lines"))
+  if (!is.null(title)) p <- p + labs(title = title)
+  return(p)
+}
+```
+
+## Column Mappings
+
+```{r column_mappings}
+cell_names_list_exact <- list(
+  c('microglia', 'Microglia'),
+  c('neuron', 'Neuron'),
+  c('astrocyte', 'Astrocyte'),
+  c('oligodendrocyte', 'Oligodendrocyte')
+)
+cell_names_exact_df <- as.data.frame(do.call(rbind, cell_names_list_exact))
+colnames(cell_names_exact_df) <- c("Original", "Replacement")
+
+gwas_names <- c('Kunkle (2019)', 'Jansen (2019)', 'Wightman (2021)', 'Bellenguez (2022)')
+```
+
+## Constants
+
+```{r constants}
+h2_kunkle_ridge <- 0.1229
+M_kunkle_ridge <- 9418280
+h2_bellenguez_ADSP_ridge <- 0.0618
+M_bellenguez_ADSP_ridge <- 16013174
+PIP_thresholds <- c(0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)
+
+count_unique_credible_sets <- function(df, pip_thresholds) {
+  result <- lapply(pip_thresholds, function(threshold) {
+    filtered_df <- df[df$PIP >= threshold & df$P_top_pip < 0.05, ]
+    counts <- aggregate(CREDIBLE_SET ~ fine_mapping_type,
+                        data = filtered_df,
+                        FUN = function(x) length(unique(x)))
+    counts$PIP_threshold <- threshold
+    counts
+  })
+  do.call(rbind, result)
+}
+
+count_variants_nonCS <- function(df, pip_thresholds) {
+  result <- lapply(pip_thresholds, function(threshold) {
+    filtered_df <- df[df$PIP >= threshold & df$P < 0.05, ]
+    counts <- filtered_df %>% group_by(fine_mapping_type) %>% tally()
+    counts$PIP_threshold <- threshold
+    counts
+  })
+  do.call(rbind, result)
+}
+```
+
+
+# Load Data
+
+## Per-GWAS Annotation Files
+
+Each file contains Baseline + Glass Epigenomics + Enformer TF/Glass + ChromBPNet results.
+
+```{r load_annotations}
+annotations_kunkle <- read_delim(
+  paste0(DATA_DIR, "/annotations_kunkle.tsv"),
+  delim = "\t", escape_double = FALSE, trim_ws = TRUE
+)
+
+annotations_wightman <- read_delim(
+  paste0(DATA_DIR, "/annotations_wightman.tsv"),
+  delim = "\t", escape_double = FALSE, trim_ws = TRUE
+)
+
+annotations_bellenguez <- read_delim(
+  paste0(DATA_DIR, "/annotations_bellenguez.tsv"),
+  delim = "\t", escape_double = FALSE, trim_ws = TRUE
+)
+
+# Combined for supplementary figures
+cell_CRE_multgwas_ldsc <- bind_rows(annotations_kunkle, annotations_wightman, annotations_bellenguez) %>%
+  mutate(gwas_name = factor(gwas_name, levels = c('Kunkle (2019)', 'Wightman (2021)', 'Bellenguez (2022)')))
+```
+
+## Multivariate LDSC
+
+```{r load_multivariate}
+multivariate_with_se <- read_delim(
+  paste0(DATA_DIR, "/multivariate_annotations_final.tsv"),
+  delim = "\t", escape_double = FALSE, trim_ws = TRUE
+)
+```
+
+## Fine-Mapping Data
+
+```{r load_finemapping}
+pip_threshold <- 0.50
+
+zzz1 <- read_delim(paste0(DATA_DIR, "/bellenguez_susie.txt.gz"),
+  "\t", escape_double = FALSE, trim_ws = TRUE) %>%
+  filter((PIP >= pip_threshold) | (!str_ends(CREDIBLE_SET, ':0'))) %>%
+  mutate(fine_mapping_type = 'SUSIE')
+
+zzz2 <- read_delim(paste0(DATA_DIR, "/bellenguez_baseline.txt.gz"),
+  "\t", escape_double = FALSE, trim_ws = TRUE) %>%
+  filter((PIP >= pip_threshold) | (!str_ends(CREDIBLE_SET, ':0'))) %>%
+  mutate(fine_mapping_type = 'Baseline')
+
+zzz3 <- read_delim(paste0(DATA_DIR, "/bellenguez_omics.txt.gz"),
+  "\t", escape_double = FALSE, trim_ws = TRUE) %>%
+  filter((PIP >= pip_threshold) | (!str_ends(CREDIBLE_SET, ':0'))) %>%
+  mutate(fine_mapping_type = 'Baseline/Omics')
+
+zzz4 <- read_delim(paste0(DATA_DIR, "/bellenguez_omics_dl.txt.gz"),
+  "\t", escape_double = FALSE, trim_ws = TRUE) %>%
+  filter((PIP >= pip_threshold) | (!str_ends(CREDIBLE_SET, ':0'))) %>%
+  mutate(fine_mapping_type = 'Baseline/Omics/DL')
+```
+
+## Process Fine-Mapping Counts
+
+```{r process_finemapping}
+susie_finemap_singleton <- zzz1 %>% filter(str_ends(CREDIBLE_SET, ':0'))
+susie_finemap_CS <- zzz1 %>% filter(!str_ends(CREDIBLE_SET, ':0'))
+baseline_finemap_singleton <- zzz2 %>% filter(str_ends(CREDIBLE_SET, ':0'))
+baseline_finemap_CS <- zzz2 %>% filter(!str_ends(CREDIBLE_SET, ':0'))
+omics_finemap_singleton <- zzz3 %>% filter(str_ends(CREDIBLE_SET, ':0'))
+omics_finemap_CS <- zzz3 %>% filter(!str_ends(CREDIBLE_SET, ':0'))
+omics_dl_finemap_singleton <- zzz4 %>% filter(str_ends(CREDIBLE_SET, ':0'))
+omics_dl_finemap_CS <- zzz4 %>% filter(!str_ends(CREDIBLE_SET, ':0'))
+
+finemapped_combined_CS <- bind_rows(susie_finemap_CS, baseline_finemap_CS, omics_finemap_CS, omics_dl_finemap_CS)
+finemapped_combined_singleton <- bind_rows(susie_finemap_singleton, baseline_finemap_singleton, omics_finemap_singleton, omics_dl_finemap_singleton)
+
+CS_statistics <- finemapped_combined_CS %>%
+  group_by(fine_mapping_type, CREDIBLE_SET) %>%
+  summarise(PIP = max(PIP), CS_size = n(), P_top_pip = P[which.max(PIP)], .groups = "drop")
+
+CS_statistics_summary <- count_unique_credible_sets(CS_statistics, PIP_thresholds) %>%
+  mutate(PIP_threshold = as.factor(PIP_threshold)) %>%
+  mutate(variant_type = 'Credible Sets') %>%
+  mutate(n = CREDIBLE_SET)
+
+singleton_statistics_summary <- count_variants_nonCS(finemapped_combined_singleton, PIP_thresholds) %>%
+  mutate(PIP_threshold = as.factor(PIP_threshold)) %>%
+  mutate(variant_type = 'Non Credible Set Variants')
+
+finemapped_combined_thresholds_combined <- bind_rows(CS_statistics_summary, singleton_statistics_summary)
+finemapped_combined_thresholds_combined$fine_mapping_type <- factor(
+  finemapped_combined_thresholds_combined$fine_mapping_type,
+  levels = c('SUSIE', 'Baseline', 'Baseline/Omics', 'Baseline/Omics/DL')
+)
+```
+
+## PRS Data (Pre-computed)
+
+```{r load_prs}
+summary_SNPS <- read_delim(paste0(DATA_DIR, "/prs_auc_summary.tsv"),
+  delim = "\t", escape_double = FALSE, trim_ws = TRUE)
+
+PRS_results <- read_delim(paste0(DATA_DIR, "/prs_odds_ratios.tsv"),
+  delim = "\t", escape_double = FALSE, trim_ws = TRUE)
+
+prevalence_by_quintile <- read_delim(paste0(DATA_DIR, "/prs_prevalence_by_decile.tsv"),
+  delim = "\t", escape_double = FALSE, trim_ws = TRUE)
+```
+
+## Variant Annotations
+
+```{r load_variant_annotations}
+top_omics_dl_finemapped_variants_annotated <- read_tsv(
+  paste0(DATA_DIR, "/top_omics_dl_finemapped_variants_annotated.tsv.gz"),
+  show_col_types = FALSE
+)
+
+parse_favor_gene <- function(info) {
+  stringr::str_extract(info, "^[A-Za-z0-9._-]+")
+}
+
+top_omics_dl_finemapped_variants_annotated <- top_omics_dl_finemapped_variants_annotated %>%
+  dplyr::mutate(
+    consensus_category = dplyr::case_when(
+      favor_category == "exonic" ~ "exonic",
+      vep_category == "ncrna_exon" ~ "ncrna_exon",
+      vep_category %in% c("UTR5", "UTR3") & favor_category %in% c("upstream", "intergenic", "intronic") ~ vep_category,
+      vep_category == "splicing" & favor_category == "intronic" ~ "splicing",
+      favor_category == "intergenic" & vep_category == "intronic" ~ "intronic",
+      favor_category == "intergenic" & vep_category == "upstream" ~ "upstream",
+      TRUE ~ favor_category
+    ),
+    consensus_gene = dplyr::case_when(
+      consensus_category == "intergenic" ~ "",
+      consensus_category %in% c("ncrna_exon", "UTR5", "UTR3", "upstream", "splicing") &
+        !is.na(vep_gene_symbol) & vep_gene_symbol != "" ~ vep_gene_symbol,
+      !is.na(favor_raw_info) & favor_raw_info != "" ~ parse_favor_gene(favor_raw_info),
+      TRUE ~ dplyr::coalesce(vep_gene_symbol, "")
+    ),
+    meta_category = dplyr::case_when(
+      `GenecodeComprehensiveExonicCategory.String` == "nonsynonymous SNV" ~ "Coding - Missense",
+      `GenecodeComprehensiveExonicCategory.String` == "synonymous SNV" ~ "Coding - Synonymous",
+      `GenecodeComprehensiveExonicCategory.String` == "stopgain" ~ "Stop Gained",
+      consensus_category == "exonic" ~ "Coding - Other",
+      consensus_category == "intronic" ~ "Intronic",
+      consensus_category == "intergenic" ~ "Intergenic",
+      TRUE ~ "Miscellaneous"
+    )
+  )
+
+exonic_variants <- top_omics_dl_finemapped_variants_annotated %>%
+  dplyr::filter(FunseqDescription.String == 'coding')
+
+noncoding_variants <- top_omics_dl_finemapped_variants_annotated %>%
+  dplyr::filter(FunseqDescription.String == 'noncoding')
+```
+
+## ATAC Peaks, ABC, PLAC-seq
+
+```{r load_peaks_abc}
+microglia_ATAC <- read.table(paste0(DATA_DIR, '/PU1_promoter_enhancer_plus_atac.bed'), sep = '\t')
+colnames(microglia_ATAC) <- c('chrom', 'start', 'end')
+
+oligodendrocyte_ATAC <- read.table(paste0(DATA_DIR, '/Olig2_promoter_enhancer_plus_atac.bed'), sep = '\t')
+colnames(oligodendrocyte_ATAC) <- c('chrom', 'start', 'end')
+
+astrocyte_ATAC <- read.table(paste0(DATA_DIR, '/LHX2_promoter_enhancer_plus_atac.bed'), sep = '\t')
+colnames(astrocyte_ATAC) <- c('chrom', 'start', 'end')
+
+neuron_ATAC <- read.table(paste0(DATA_DIR, '/NeuN_promoter_enhancer_plus_atac.bed'), sep = '\t')
+colnames(neuron_ATAC) <- c('chrom', 'start', 'end')
+
+noncoding_variants_peak <- annotate_peak_overlap(noncoding_variants, microglia_ATAC, 'peak_microglia_ATAC')
+noncoding_variants_peak <- annotate_peak_overlap(noncoding_variants_peak, oligodendrocyte_ATAC, 'peak_oligodendrocyte_ATAC')
+noncoding_variants_peak <- annotate_peak_overlap(noncoding_variants_peak, astrocyte_ATAC, 'peak_astrocyte_ATAC')
+noncoding_variants_peak <- annotate_peak_overlap(noncoding_variants_peak, neuron_ATAC, 'peak_neuron_ATAC')
+
+ABC_microglia <- read_delim(paste0(DATA_DIR, "/microglia_EnhancerPredictionsAllPutative.tsv.gz"),
+  delim = "\t", escape_double = FALSE, trim_ws = TRUE)
+ABC_oligodendrocyte <- read_delim(paste0(DATA_DIR, "/oligodendrocyte_EnhancerPredictionsAllPutative.tsv.gz"),
+  delim = "\t", escape_double = FALSE, trim_ws = TRUE)
+ABC_astrocyte <- read_delim(paste0(DATA_DIR, "/astrocyte_EnhancerPredictionsAllPutative.tsv.gz"),
+  delim = "\t", escape_double = FALSE, trim_ws = TRUE)
+ABC_neuron <- read_delim(paste0(DATA_DIR, "/neuron_EnhancerPredictionsAllPutative.tsv.gz"),
+  delim = "\t", escape_double = FALSE, trim_ws = TRUE)
+
+noncoding_variants_peak <- get_top_enhancer_variant_matches(noncoding_variants_peak, ABC_microglia) %>%
+  dplyr::rename(microglia_enhancer_name = enhancer_name, microglia_TargetGene = TargetGene, microglia_ABC.Score = ABC.Score)
+noncoding_variants_peak <- get_top_enhancer_variant_matches(noncoding_variants_peak, ABC_oligodendrocyte) %>%
+  dplyr::rename(oligodendrocyte_enhancer_name = enhancer_name, oligodendrocyte_TargetGene = TargetGene, oligodendrocyte_ABC.Score = ABC.Score)
+noncoding_variants_peak <- get_top_enhancer_variant_matches(noncoding_variants_peak, ABC_astrocyte) %>%
+  dplyr::rename(astrocyte_enhancer_name = enhancer_name, astrocyte_TargetGene = TargetGene, astrocyte_ABC.Score = ABC.Score)
+noncoding_variants_peak <- get_top_enhancer_variant_matches(noncoding_variants_peak, ABC_neuron) %>%
+  dplyr::rename(neuron_enhancer_name = enhancer_name, neuron_TargetGene = TargetGene, neuron_ABC.Score = ABC.Score)
+
+placseq_interactions <- read.table(paste0(DATA_DIR, '/placseq_interactions_hg38.tsv'), sep = '\t', header = TRUE)
+
+noncoding_variants_peak <- get_top_placseq_variant_matches(noncoding_variants_peak, placseq_interactions, 'PU1_enhancer_interactions') %>%
+  dplyr::rename(microglia_placseq_TargetGene = TargetGene, microglia_placseq_interactions = num_iteractions)
+noncoding_variants_peak <- get_top_placseq_variant_matches(noncoding_variants_peak, placseq_interactions, 'NeuN_enhancer_interactions') %>%
+  dplyr::rename(neuron_placseq_TargetGene = TargetGene, neuron_placseq_interactions = num_iteractions)
+noncoding_variants_peak <- get_top_placseq_variant_matches(noncoding_variants_peak, placseq_interactions, 'Olig2_enhancer_interactions') %>%
+  dplyr::rename(oligodendrocyte_placseq_TargetGene = TargetGene, oligodendrocyte_placseq_interactions = num_iteractions)
+
+noncoding_variants_peak <- noncoding_variants_peak %>%
+  mutate(microglia_evidence = peak_microglia_ATAC) %>%
+  mutate(oligodendrocyte_evidence = peak_oligodendrocyte_ATAC) %>%
+  mutate(neuron_evidence = peak_neuron_ATAC) %>%
+  mutate(astrocyte_evidence = peak_astrocyte_ATAC)
+```
+
+## Build Upset Data
+
+```{r build_upset}
+upset_variant_list <- bind_rows(
+  exonic_variants %>% dplyr::select(VariantVcf.String, CHR, BP, A1, A2, meta_category,
+    GenecodeComprehensiveCategory.String, GenecodeComprehensiveExonicCategory.String),
+  noncoding_variants_peak %>% dplyr::select(VariantVcf.String, CHR, BP, A1, A2, meta_category,
+    GenecodeComprehensiveCategory.String, GenecodeComprehensiveExonicCategory.String,
+    microglia_evidence, oligodendrocyte_evidence, neuron_evidence, astrocyte_evidence)
+)
+
+upset_variant_list <- upset_variant_list %>%
+  dplyr::mutate(
+    `Microglia CRE`       = dplyr::coalesce(microglia_evidence == 1, FALSE),
+    `Astrocyte CRE`       = dplyr::coalesce(astrocyte_evidence == 1, FALSE),
+    `Neuron CRE`          = dplyr::coalesce(neuron_evidence == 1, FALSE),
+    `Oligodendrocyte CRE` = dplyr::coalesce(oligodendrocyte_evidence == 1, FALSE),
+    `Intronic`            = meta_category == "Intronic",
+    `Miscellaneous`       = meta_category == "Miscellaneous",
+    `Coding - Synonymous` = meta_category == "Coding - Synonymous",
+    `Coding - Missense`   = meta_category == "Coding - Missense",
+    `Stop Gained`         = meta_category == "Stop Gained",
+    `Intergenic`          = meta_category == "Intergenic"
+  ) %>%
+  dplyr::select(VariantVcf.String, `Microglia CRE`, `Astrocyte CRE`, `Neuron CRE`, `Oligodendrocyte CRE`,
+    `Intronic`, `Miscellaneous`, `Coding - Synonymous`, `Coding - Missense`, `Stop Gained`, `Intergenic`)
+
+region_names <- colnames(upset_variant_list)[-1]
+```
+
+## caQTL Data
+
+```{r load_caqtl}
+TF_microglia <- c('ETS2', 'FLI1', 'SPI1', 'IRF8', 'PRDM1', 'CEBPA', 'CEBPB', 'CEBPD', 'CEBPE',
+    'KLF11', 'KLF2', 'TFEC', 'BACH1', 'BATF', 'BATF3', 'RUNX1', 'RUNX2', 'RUNX3',
+    'LYL1', 'TAL1', 'ELK3', 'MEF2C', 'CREB3L2', 'ATF4', 'MAFB', 'SALL1', 'eGFP-SALL1',
+    'SMAD5', 'MEF2A', 'MEF2B', 'SMAD2', 'USF1', 'STAT3', 'eGFP-MAFG', 'NFYB', 'NRF1', 'CREB1', 'IRF1',
+    'SOX9', 'SP1', 'IRF4', '3xFLAG-NFYC', 'ZNF384', 'MITF', 'JUNB', 'MAFF')
+
+caQTL_chrombpnet_peak_centered <- read_delim(paste0(DATA_DIR, "/chrombpnet_microglia_peak_centered_PIP_090.tsv"),
+  delim = "\t", escape_double = FALSE, trim_ws = TRUE) %>%
+  dplyr::select(SNP, PIP_filter, ChromBPNet_microglia_score = log_counts_diff_chrombpnet_abs)
+
+caQTL_enformer_peak_centered <- read_delim(paste0(DATA_DIR, "/enformer_microglia_peak_centered_PIP_090.tsv"),
+  delim = "\t", escape_double = FALSE, trim_ws = TRUE) %>%
+  dplyr::select(SNP, PIP_filter, Enformer_TF_score = log_counts_diff_enformer_TF_abs,
+    Enformer_DNASE_monocyte_score = log_counts_diff_enformer_monocyte_DNASE_abs)
+
+motifBreakR <- read_delim(paste0(DATA_DIR, "/mb_output.tsv"),
+  delim = "\t", escape_double = FALSE, trim_ws = TRUE) %>%
+  mutate(motifBreakR_score = abs(alleleDiff)) %>%
+  filter(geneSymbol %in% TF_microglia) %>%
+  group_by(SNP_id) %>%
+  summarize(motifBreakR_score = mean(motifBreakR_score)) %>%
+  ungroup() %>%
+  dplyr::select(SNP = SNP_id, motifBreakR_score)
+
+rsid_list <- caQTL_chrombpnet_peak_centered %>% dplyr::select(SNP)
+motifBreakR <- motifBreakR %>% left_join(rsid_list, by = 'SNP')
+
+caQTL_enformer_predictions_peaks <- caQTL_chrombpnet_peak_centered %>%
+  inner_join(caQTL_enformer_peak_centered, by = c('SNP', 'PIP_filter')) %>%
+  inner_join(motifBreakR, by = c('SNP')) %>%
+  pivot_longer(cols = ChromBPNet_microglia_score:motifBreakR_score, names_to = 'Annotation', values_to = 'score') %>%
+  mutate(model = case_when(
+    Annotation == 'Enformer_TF_score' ~ 'Enformer TF',
+    Annotation == 'Enformer_DNASE_monocyte_score' ~ 'Enformer DNASE',
+    Annotation == 'ChromBPNet_microglia_score' ~ 'ChromBPNet ATAC',
+    Annotation == 'motifBreakR_score' ~ 'motifBreakR'
+  ))
+
+caQTL_chrombpnet_no_distance <- read_delim(paste0(DATA_DIR, "/chrombpnet_microglia_no_distance_PIP_090.tsv"),
+  delim = "\t", escape_double = FALSE, trim_ws = TRUE) %>%
+  dplyr::select(SNP, PIP_filter, ChromBPNet_microglia_score = log_counts_diff_chrombpnet_abs)
+
+caQTL_enformer_no_distance <- read_delim(paste0(DATA_DIR, "/enformer_microglia_no_distance_PIP_090.tsv"),
+  delim = "\t", escape_double = FALSE, trim_ws = TRUE) %>%
+  dplyr::select(SNP, PIP_filter, Enformer_TF_score = log_counts_diff_enformer_TF_abs,
+    Enformer_DNASE_monocyte_score = log_counts_diff_enformer_monocyte_DNASE_abs)
+
+caQTL_enformer_predictions_nonpeaks <- caQTL_chrombpnet_no_distance %>%
+  inner_join(caQTL_enformer_no_distance, by = c('SNP', 'PIP_filter')) %>%
+  pivot_longer(cols = ChromBPNet_microglia_score:Enformer_DNASE_monocyte_score, names_to = 'Annotation', values_to = 'score') %>%
+  mutate(model = case_when(
+    Annotation == 'Enformer_TF_score' ~ 'Enformer TF',
+    Annotation == 'Enformer_DNASE_monocyte_score' ~ 'Enformer DNASE',
+    Annotation == 'ChromBPNet_microglia_score' ~ 'ChromBPNet ATAC'
+  ))
+```
+
+
+# Figure 2: Cell Type Enrichment + caQTL AUPRC
+
+## caQTL AUPRC Plots
+
+```{r figure2_caqtl}
+plot_caqtl_density_peak <- ggplot(caQTL_enformer_predictions_peaks, aes(x = score, fill = PIP_filter)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~model, scales = 'free') +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                labels = trans_format("log10", math_format(10^.x))) +
+  scale_fill_npg() + theme_nature() +
+  xlab('VEP Score') + ylab('Density') + labs(fill = "PIP Threshold") +
+  theme(legend.position = "bottom") + ggtitle('Peak Centered Scores')
+
+plot_caqtl_density_nonpeak <- ggplot(caQTL_enformer_predictions_nonpeaks, aes(x = score, fill = PIP_filter)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~model, scales = 'free', ncol = 2) +
+  scale_x_log10(labels = trans_format("log10", math_format(10^.x))) +
+  scale_fill_npg() + theme_nature() +
+  xlab('VEP Score') + ylab('Density') + labs(fill = "PIP Threshold") +
+  theme(legend.position = "bottom") + ggtitle('Variant Centered Scores')
+
+plot_auprc_cqtl_peak <- make_auprc_plot_90_modified(caQTL_enformer_predictions_peaks, text_position = "bottom", title = "Peak Centered Scores", text_size = 2) + theme_nature()
+plot_auprc_cqtl_nonpeak <- make_auprc_plot_90_modified(caQTL_enformer_predictions_nonpeaks, text_position = "top", title = "Variant Centered Scores", text_size = 2) + theme_nature()
+
+plot_caqtl_density_combined <- (plot_caqtl_density_peak | plot_caqtl_density_nonpeak) +
+  plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+plot_auprc_cqtl_combined <- (plot_auprc_cqtl_peak | plot_auprc_cqtl_nonpeak) +
+  plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+plot_composite_density_auprc_microglia_qtl <- plot_caqtl_density_combined / plot_auprc_cqtl_combined
+plot_composite_density_auprc_microglia_qtl <- plot_composite_density_auprc_microglia_qtl &
+  theme(legend.key.size = unit(0.8, "lines"),
+        legend.spacing.x = unit(0.2, 'cm'),
+        legend.spacing.y = unit(0.1, 'cm'),
+        legend.margin = margin(t = 0, r = 0, b = 0, l = 0))
+
+plot_caqtl_density_peak
+plot_caqtl_density_nonpeak
+plot_auprc_cqtl_peak
+plot_auprc_cqtl_nonpeak
+```
+
+## Cell Type Enrichment
+
+```{r figure2_cell_type}
+cell_filter <- c('microglia', 'neuron', 'astrocyte', 'oligodendrocyte')
+genomic_region_filter <- c('enhancer_promoter_union_atac_500')
+cell_order <- c('Microglia', 'Neuron', 'Oligodendrocyte', 'Astrocyte')
+cell_order_reverse <- c('Astrocyte', 'Oligodendrocyte', 'Neuron', 'Microglia')
+
+cell_type_df <- bind_rows(
+  annotations_kunkle %>%
+    filter(data_source == 'Glass Epigenomics') %>%
+    filter(cell_name %in% cell_filter) %>%
+    filter(assay %in% genomic_region_filter) %>%
+    mutate(gwas = gwas_names[1]),
+  annotations_wightman %>%
+    filter(data_source == 'Glass Epigenomics') %>%
+    filter(cell_name %in% cell_filter) %>%
+    filter(assay %in% genomic_region_filter) %>%
+    mutate(gwas = gwas_names[3]),
+  annotations_bellenguez %>%
+    filter(data_source == 'Glass Epigenomics') %>%
+    filter(cell_name %in% cell_filter) %>%
+    filter(assay %in% genomic_region_filter) %>%
+    mutate(gwas = gwas_names[4])
+) %>%
+  rename_strings_dataframe_exact(cell_name, cell_names_exact_df) %>%
+  mutate(cell_name = factor(cell_name, levels = cell_order)) %>%
+  mutate(h2_CI_low = Prop._h2 - 1.96 * Prop._h2_std_error) %>%
+  mutate(h2_CI_high = Prop._h2 + 1.96 * Prop._h2_std_error) %>%
+  mutate(gwas = factor(gwas, levels = gwas_names))
+
+plot_prop_SNPs <- ggplot(cell_type_df, aes(x = gwas, y = Prop._SNPs, fill = cell_name)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  coord_flip() + xlab("GWAS") + ylab('Proportion of SNPs in Cell Type CRE') +
+  labs(fill = "Cell Type") + scale_fill_npg(breaks = cell_order_reverse) +
+  theme_nature() + theme(legend.position = "none")
+
+plot_prop_h2 <- ggplot(cell_type_df, aes(x = gwas, y = Prop._h2, fill = cell_name)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  coord_flip() + xlab(NULL) + ylab('Proportion of Heritability') +
+  labs(fill = "Cell Type") +
+  geom_errorbar(aes(ymin = h2_CI_low, ymax = h2_CI_high), width = .2, position = position_dodge(.9)) +
+  scale_fill_npg(breaks = cell_order_reverse) + theme_nature() +
+  theme(axis.text.y = element_blank(), axis.title.y = element_blank(), legend.position = "none")
+
+plot_enrichment <- ggplot(cell_type_df, aes(x = gwas, y = Enrichment, fill = cell_name)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  coord_flip() + xlab(NULL) + ylab('Enrichment of Heritability') +
+  labs(fill = "Cell Type") +
+  geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = .2, position = position_dodge(.9)) +
+  scale_fill_npg(breaks = cell_order_reverse) + theme_nature() +
+  theme(axis.text.y = element_blank(), axis.title.y = element_blank())
+
+cell_type_plot <- (plot_prop_SNPs | plot_prop_h2 | plot_enrichment) +
+  plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+plot_prop_SNPs
+plot_prop_h2
+plot_enrichment
+```
+
+## Figure 2 Composite
+
+```{r figure2_composite, fig.width=7, fig.height=8.3}
+figure2 <- (cell_type_plot / plot_composite_density_auprc_microglia_qtl) + plot_layout(height = c(1, 2))
+
+figure2
+
+```
+
+
+# Figure 3: Pareto Plot + Multivariate tau*
+
+## Pareto Plot
+
+```{r figure3_pareto}
+cols_filter <- c(
+  'chrombpnet_microglia-enhancer_promoter_union_atac_500-microglia_combined-zscore_1_1',
+  'chrombpnet_neuron-enhancer_promoter_union_atac_500-neuron_combined-zscore_1_1',
+  'astrocyte-enhancer_promoter_union_atac_500-astrocyte-zscore_1_1',
+  'astrocyte-enhancer_promoter_union_atac_500-astrocyte-zscore_2_1',
+  'astrocyte-enhancer_promoter_union_atac_500-astrocyte-zscore_3_1',
+  'microglia-enhancer_promoter_union_atac_500-microglia-zscore_1_1',
+  'microglia-enhancer_promoter_union_atac_500-microglia-zscore_2_1',
+  'microglia-enhancer_promoter_union_atac_500-microglia-zscore_3_1',
+  'neuron-enhancer_promoter_union_atac_500-neuron-zscore_1_1',
+  'neuron-enhancer_promoter_union_atac_500-neuron-zscore_2_1',
+  'neuron-enhancer_promoter_union_atac_500-neuron-zscore_3_1',
+  'oligodendrocyte-enhancer_promoter_union_atac_500-oligodendrocyte-zscore_1_1',
+  'oligodendrocyte-enhancer_promoter_union_atac_500-oligodendrocyte-zscore_2_1',
+  'oligodendrocyte-enhancer_promoter_union_atac_500-oligodendrocyte-zscore_3_1',
+  'astrocyte_enhancer_promoter_union_atac_500_1',
+  'microglia_enhancer_promoter_union_atac_500_1',
+  'neuron_enhancer_promoter_union_atac_500_1',
+  'oligodendrocyte_enhancer_promoter_union_atac_500_1'
+)
+
+cell_type_df_subset <- annotations_bellenguez %>%
+  filter(Category %in% cols_filter) %>%
+  mutate(annotation_type = case_when(
+    (data_source == 'Enformer Tensorflow TF/Glass Epigenomics' & pct_category == 'zscore_1') ~ 'TF ZS>1',
+    (data_source == 'Enformer Tensorflow TF/Glass Epigenomics' & pct_category == 'zscore_2') ~ 'TF ZS>2',
+    (data_source == 'Enformer Tensorflow TF/Glass Epigenomics' & pct_category == 'zscore_3') ~ 'TF ZS>3',
+    (data_source == 'ChromBPNet Enformer Tensorflow TF/Glass Epigenomics' & pct_category == 'zscore_1') ~ 'TF+C ZS>1',
+    (data_source == 'Glass Epigenomics') ~ 'CRE'
+  )) %>%
+  mutate(cell_name_formal = case_when(
+    cell_name == 'astrocyte' ~ 'Astrocyte',
+    cell_name == 'microglia' ~ 'Microglia',
+    cell_name == 'neuron' ~ 'Neuron',
+    cell_name == 'oligodendrocyte' ~ 'Oligodendrocyte',
+    cell_name == 'chrombpnet_microglia' ~ 'Microglia',
+    cell_name == 'chrombpnet_neuron' ~ 'Neuron'
+  )) %>%
+  mutate(cell_name_formal = factor(cell_name_formal, levels = cell_order)) %>%
+  filter(cell_name_formal != 'Astrocyte')
+
+cell_type_df_subset_nochrombpnet <- cell_type_df_subset %>% filter(annotation_type != 'TF+C ZS>1')
+cell_type_df_subset_chrombpnet <- cell_type_df_subset %>% filter(annotation_type == 'TF+C ZS>1')
+cell_type_df_subset_nochrombpnet$annotation_type <- factor(cell_type_df_subset_nochrombpnet$annotation_type,
+  levels = c("CRE", "TF ZS>1", "TF ZS>2", "TF ZS>3"))
+cell_type_df_subset_nochrombpnet <- cell_type_df_subset_nochrombpnet %>% arrange(cell_name, annotation_type)
+
+pareto_text_size <- 3
+
+pareto_plot <- ggplot(cell_type_df_subset_nochrombpnet,
+  aes(x = Enrichment, y = Prop._h2, color = cell_name_formal, group = cell_name_formal)) +
+  geom_path() +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_text_repel(aes(label = annotation_type), box.padding = 0.8, point.padding = 0.5,
+    segment.color = 'grey50', show.legend = FALSE, size = pareto_text_size,
+    max.overlaps = 30, force = 10, force_pull = 0.2, direction = "both") +
+  geom_point(data = cell_type_df_subset_chrombpnet,
+    aes(x = Enrichment, y = Prop._h2, color = cell_name_formal), size = 3) +
+  geom_text_repel(data = cell_type_df_subset_chrombpnet,
+    aes(x = Enrichment, y = Prop._h2, label = annotation_type, color = cell_name_formal),
+    box.padding = 1.0, point.padding = 0.8, segment.color = 'grey50', show.legend = FALSE,
+    size = pareto_text_size, max.overlaps = 30, nudge_y = 0.05, force = 15, direction = "both") +
+  theme_nature() + scale_fill_npg() + scale_color_npg() +
+  labs(title = "Enrichment and Proportion of Heritability of AD GWAS within Brain Cell Types",
+    x = "Enrichment of Heritability", y = "Proportion of Heritability", color = "Cell Type") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "darkgrey") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "darkgrey") +
+  theme(legend.position = "bottom")
+```
+
+## Multivariate tau*
+
+```{r figure3_multivariate}
+annotation_order <- c('Baseline', 'Roadmap', 'Enformer', 'Brain Omics/Enformer/ChromBPNet', 'SpliceAI/AlphaMissense')
+
+annotation_colors_vec <- c(
+  'Baseline' = npg_colors[1],
+  "Roadmap" = npg_colors[2],
+  "Enformer" = npg_colors[3],
+  "Brain Omics/Enformer/ChromBPNet" = npg_colors[4],
+  "SpliceAI/AlphaMissense" = npg_colors[5]
+)
+
+multivariate_filtered <- multivariate_with_se %>%
+  filter(Enrichment_p < 0.05 & tau_star > 0 & Enrichment > 5.0) %>%
+  mutate(name = case_when(
+    id == 'TSS_Hoffman.extend.500' ~ 'TSS_Hoffman',
+    id == 'Coding_UCSC.extend.500' ~ 'Coding_UCSC',
+    id == 'alleleage' ~ 'Allele Age',
+    id == 'Ancient_Sequence_Age_Human_Promoter.extend.500' ~ 'Ancient Sequence Age Promoter',
+    id == 'BLUEPRINT_FE_META_TISSUE_DNAMETH_MaxCPP' ~ 'DNA Methylation Multi-Tissue',
+    id == 'BLUEPRINT_FE_META_TISSUE_H3K27ac_MaxCPP' ~ 'H3K27ac Multi-Tissue',
+    id == 'Conserved_Mammal_phastCons46way.extend.500' ~ 'Conserved PhastCons46way',
+    id == 'microglia_enhancer_intersect_atac' ~ 'Microglia-ATAC/Enhancer',
+    id == 'diff_32_ENCFF748RWG_zscore_1' ~ 'CHIP:POLR2AphosS5-Spleen (ZS1)',
+    id == 'diff_32_ENCFF472KMT_zscore' ~ 'CHIP:ATF2 (ZS3)',
+    id == 'diff_32_ENCFF476YVH_zscore_2' ~ 'CHIP:H3K27me3:Liver (ZS2)',
+    id == 'Human_Enhancer_Villar_Species_Enhancer_Count' ~ 'Enhancer Species-Villar',
+    id == 'H3K27ac_PGC2' ~ 'H3K27ac PGC2',
+    id == 'H3K4me3_Trynka' ~ 'H3K4me3 Trynka',
+    id == 'Conserved_Primate_phastCons46way' ~ 'Conserved Primate phastCons',
+    id == 'DGF_ENCODE.extend.500' ~ 'DGF ENCODE',
+    id == 'Human_Enhancer_Villar.extend.500' ~ 'Human Enhancer Villar',
+    id == 'E051-H3K27ac.imputed.narrowPeak' ~ 'CD34+ H3K27ac',
+    id == 'diff_32_ENCFF316ZVD_zscore_1' ~ 'CHIP:H3K4me3:PBMC (ZS1)',
+    id == 'diff_32_ENCFF572IZL_zscore_2' ~ 'CHIP:H4K20me1:B cell (ZS2)',
+    id == 'diff_32_ENCFF991YWM_zscore' ~ 'CHIP:DNASE:RPMI-7951 (ZS3)',
+    id == 'diff_32_ENCFF890NAY_zscore_2' ~ 'CHIP:H3K27ac:DOHH2 (ZS2)',
+    id == 'chrombpnet_microglia-enhancer_promoter_union_atac_500-microglia_combined-zscore_1' ~ 'Microglia/Enformer CRE (ZS1)',
+    id == 'chrombpnet_neuron-enhancer_promoter_union_atac_500-neuron_combined-zscore_3' ~ 'Neuron/Enformer CRE (ZS3)',
+    id == 'TSS_Hoffman' ~ 'TSS Hoffman',
+    id == 'all_celltype_spliceai_05_or_alphamissense' ~ 'SpliceAI/AlphaMissense',
+    id == 'GTEx_FE_META_TISSUE_GE_MaxCPP' ~ 'GTEx_FE_META_TISSUE_GE_MaxCPP',
+    id == 'Vahedi_Tcell_SE' ~ 'Vahedi Tcell SE',
+    id == 'Enhancer_Hoffman.extend.500' ~ 'Enhancer Hoffman',
+    id == 'Promoter_UCSC' ~ 'Promoter UCSC',
+    id == 'BivFlnk' ~ 'BivFlnk',
+    id == 'E030-H3K4me1.imputed.narrowPeak' ~ 'Neutrophils H3K4me1',
+    id == 'E031-DNase.imputed.narrowPeak' ~ 'B Cell DNase',
+    id == 'E051-DNase.imputed.narrowPeak' ~ 'Hematopoietic Stem Cell DNase',
+    id == 'BivFlnk.extend.500' ~ 'BivFlnk Extended '
+  )) %>%
+  mutate(annotation = case_when(
+    id %in% c('TSS_Hoffman.extend.500', 'Coding_UCSC.extend.500', 'alleleage',
+              'Ancient_Sequence_Age_Human_Promoter.extend.500', 'BLUEPRINT_FE_META_TISSUE_DNAMETH_MaxCPP',
+              'BLUEPRINT_FE_META_TISSUE_H3K27ac_MaxCPP', 'Conserved_Mammal_phastCons46way.extend.500',
+              'Human_Enhancer_Villar_Species_Enhancer_Count', 'H3K27ac_PGC2', 'H3K4me3_Trynka',
+              'Conserved_Primate_phastCons46way', 'DGF_ENCODE.extend.500', 'Human_Enhancer_Villar.extend.500',
+              'TSS_Hoffman', 'GTEx_FE_META_TISSUE_GE_MaxCPP', 'Vahedi_Tcell_SE',
+              'Enhancer_Hoffman.extend.500', 'Promoter_UCSC', 'BivFlnk', 'BivFlnk.extend.500') ~ 'Baseline',
+    id %in% c('E051-H3K27ac.imputed.narrowPeak', 'E030-H3K4me1.imputed.narrowPeak',
+              'E031-DNase.imputed.narrowPeak', 'E051-DNase.imputed.narrowPeak') ~ 'Roadmap',
+    id %in% c('diff_32_ENCFF748RWG_zscore_1', 'diff_32_ENCFF472KMT_zscore', 'diff_32_ENCFF476YVH_zscore_2',
+              'diff_32_ENCFF316ZVD_zscore_1', 'diff_32_ENCFF572IZL_zscore_2', 'diff_32_ENCFF991YWM_zscore',
+              'diff_32_ENCFF890NAY_zscore_2') ~ 'Enformer',
+    id == 'microglia_enhancer_intersect_atac' ~ 'Brain Omics',
+    id %in% c('chrombpnet_microglia-enhancer_promoter_union_atac_500-microglia_combined-zscore_1',
+              'chrombpnet_neuron-enhancer_promoter_union_atac_500-neuron_combined-zscore_3') ~ 'Brain Omics/Enformer/ChromBPNet',
+    id == 'all_celltype_spliceai_05_or_alphamissense' ~ 'SpliceAI/AlphaMissense'
+  )) %>%
+  mutate(annotation = factor(annotation, levels = annotation_order))
+
+bellenguez_plot_enrichment_h2 <- ggplot(multivariate_filtered, aes(x = reorder(name, Enrichment), y = Enrichment, fill = annotation)) +
+  geom_bar(stat = "identity") + coord_flip() +
+  scale_fill_manual(values = annotation_colors_vec) +
+  xlab("Annotation") + ylab('Enrichment of Heritability') + labs(fill = "Annotation Category") +
+  geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = .2, position = position_dodge(.9)) +
+  theme_nature() + theme(legend.position = "bottom")
+
+bellenguez_plot_prop_h2 <- ggplot(multivariate_filtered, aes(x = reorder(name, Prop._h2), y = Prop._h2, fill = annotation)) +
+  geom_bar(stat = "identity") + coord_flip() +
+  scale_fill_manual(values = annotation_colors_vec) +
+  xlab("Annotation") + ylab('Proportion of Heritability') + labs(fill = "Annotation Category") +
+  geom_errorbar(aes(ymin = CI_prop_h2_low, ymax = CI_prop_h2_high), width = .2, position = position_dodge(.9)) +
+  theme_nature() + theme(legend.position = "none")
+
+bellenguez_plot_prop_SNPs <- ggplot(multivariate_filtered, aes(x = reorder(name, Prop._SNPs), y = Prop._SNPs, fill = annotation)) +
+  geom_bar(stat = "identity") + coord_flip() +
+  scale_fill_manual(values = annotation_colors_vec) +
+  xlab("Annotation") + ylab('Proportion of Variants in Annotation') + labs(fill = "Annotation Category") +
+  theme_nature() + theme(legend.position = "none")
+
+multivariate_filtered_plot <- multivariate_filtered %>%
+  filter(tau_star_pvalue < 0.05) %>%
+  mutate(tau_star_low = tau_star - 1.96 * tau_star_SE) %>%
+  mutate(tau_star_high = tau_star + 1.96 * tau_star_SE)
+
+bellenguez_plot_tau_star <- ggplot(multivariate_filtered_plot, aes(x = reorder(name, tau_star), y = tau_star, fill = annotation)) +
+  geom_bar(stat = "identity") + coord_flip() +
+  scale_fill_manual(values = annotation_colors_vec) +
+  xlab("Annotation") + ylab('tau* Coefficient') + labs(fill = "Annotation Category") +
+  geom_errorbar(aes(ymin = tau_star_low, ymax = tau_star_high), width = .2, position = position_dodge(.9)) +
+  theme_nature() + theme(legend.position = "none")
+
+composite_plot_enrichment <- (bellenguez_plot_prop_SNPs | bellenguez_plot_prop_h2) / (bellenguez_plot_enrichment_h2 | bellenguez_plot_tau_star)
+
+pareto_plot
+bellenguez_plot_prop_SNPs
+bellenguez_plot_prop_h2
+bellenguez_plot_enrichment_h2
+bellenguez_plot_tau_star
+```
+
+## Figure 3 Composite
+
+```{r figure3_composite, fig.width=7, fig.height=8.3}
+figure3 <- (pareto_plot / composite_plot_enrichment) + plot_layout(height = c(1, 2.5))
+figure3
+```
+
+
+# Figure 4: Fine-Mapping + PRS
+
+## Fine-Map Counts
+
+```{r figure4_finemap}
+finemap_bar_CS <- ggplot(data = finemapped_combined_thresholds_combined %>% filter(variant_type == 'Credible Sets'),
+  aes(x = PIP_threshold, y = n, fill = fine_mapping_type)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  xlab('Number of CS with\nMax PIP Above Threshold') +
+  scale_fill_manual(values = cohort_colors_vec) +
+  ylab('Number of Credible Sets') +
+  guides(fill = guide_legend(title = "Annotations")) +
+  theme_nature()
+
+finemap_bar_singleton <- ggplot(data = finemapped_combined_thresholds_combined %>% filter(variant_type == 'Non Credible Set Variants'),
+  aes(x = PIP_threshold, y = n, fill = fine_mapping_type)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  xlab('Number of Singleton Variants\nwith PIP Above Threshold') +
+  scale_fill_manual(values = cohort_colors_vec) +
+  ylab('Number of Variants') +
+  guides(fill = guide_legend(title = "Annotations")) +
+  theme_nature()
+
+credible_set_count_plot <- (finemap_bar_CS | finemap_bar_singleton) +
+  plot_layout(guides = "collect") & ggplot2::theme(legend.position = 'bottom')
+
+finemap_bar_CS
+finemap_bar_singleton
+```
+
+## Upset Plot
+
+```{r figure4_upset}
+upset_finemapped <- ComplexUpset::upset(upset_variant_list,
+  region_names, min_size = 2, name = 'Genomic Region',
+  queries = list(
+    upset_query(set = 'Microglia CRE', color = npg_colors[1], fill = npg_colors[1]),
+    upset_query(set = 'Neuron CRE', color = npg_colors[2], fill = npg_colors[2]),
+    upset_query(set = 'Oligodendrocyte CRE', color = npg_colors[3], fill = npg_colors[3]),
+    upset_query(set = 'Astrocyte CRE', color = npg_colors[4], fill = npg_colors[4]),
+    upset_query(set = 'Intronic', color = npg_colors[5], fill = npg_colors[5]),
+    upset_query(intersect = c('Microglia CRE'), fill = npg_colors[1],
+      only_components = c('intersections_matrix', 'Intersection size'))
+  )
+) + theme_nature()
+```
+
+## PRS AUC
+
+```{r figure4_prs}
+summary_SNPS_figure <- summary_SNPS %>%
+  mutate(annotation = case_when(
+    cohort == 'bellenguez_susie' ~ 'SUSIE',
+    cohort == 'bellenguez_baseline' ~ 'Baseline',
+    cohort == 'bellenguez_omics' ~ 'Baseline/Omics',
+    cohort == 'bellenguez_omics_dl' ~ 'Baseline/Omics/DL'
+  )) %>%
+  mutate(auc_low = auc - 1.96 * auc_se) %>%
+  mutate(auc_high = auc + 1.96 * auc_se) %>%
+  mutate(threshold = as.factor(threshold)) %>%
+  group_by(predicted_ancestry, annotation) %>% slice_max(auc, n = 1) %>% ungroup() %>%
+  mutate(ancestry_label = case_when(
+    predicted_ancestry == 'AFR' ~ 'African American',
+    predicted_ancestry == 'EUR' ~ 'European',
+    predicted_ancestry == 'AMR' ~ 'Hispanic',
+    predicted_ancestry == 'SAS' ~ 'South Asian',
+    predicted_ancestry == 'EAS' ~ 'East Asian'
+  )) %>%
+  mutate(annotation = factor(annotation, levels = c("SUSIE", "Baseline", "Baseline/Omics", "Baseline/Omics/DL"))) %>%
+  mutate(ancestry_label = factor(ancestry_label, levels = c("African American", "South Asian", "East Asian", "Hispanic", "European")))
+
+PRS_AUC_Plot_modified <- ggplot(summary_SNPS_figure, aes(x = auc, y = ancestry_label, color = annotation)) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  geom_errorbarh(aes(xmin = auc_low, xmax = auc_high), position = position_dodge(width = 0.5), height = 0.2) +
+  scale_color_manual(values = cohort_colors_vec) +
+  theme_nature() + labs(x = "PRS AUROC", y = "Ancestry", color = "Annotation") +
+  theme(legend.position = "bottom") + xlim(0.45, 0.65)
+```
+
+## Odds Ratio Plot
+
+```{r figure4_odds_ratio}
+PRS_results_modified <- PRS_results %>%
+  mutate(ancestry_label = case_when(
+    predicted_ancestry == 'AFR' ~ 'African American',
+    predicted_ancestry == 'EUR' ~ 'European',
+    predicted_ancestry == 'AMR' ~ 'Hispanic',
+    predicted_ancestry == 'SAS' ~ 'South Asian',
+    predicted_ancestry == 'EAS' ~ 'East Asian'
+  )) %>%
+  mutate(annotation_label = case_when(
+    annotation == 'BL' ~ 'Baseline',
+    annotation == 'BL/Omics' ~ 'Baseline/Omics',
+    annotation == 'BL/Omics/DL' ~ 'Baseline/Omics/DL',
+    annotation == 'SUSIE' ~ 'SUSIE'
+  )) %>%
+  mutate(annotation_label = factor(annotation_label, levels = c("SUSIE", "Baseline", "Baseline/Omics", "Baseline/Omics/DL"))) %>%
+  mutate(ancestry_label = factor(ancestry_label, levels = c("African American", "South Asian", "East Asian", "Hispanic", "European")))
+
+odds_ratio_plot <- ggplot(PRS_results_modified, aes(x = estimate, y = ancestry_label, color = annotation_label)) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), position = position_dodge(width = 0.5), height = 0.2) +
+  theme_nature() + scale_color_manual(values = cohort_colors_vec) +
+  labs(x = "Odds Ratio", y = "Ancestry", color = "Annotation") +
+  theme(legend.position = "bottom")
+```
+
+## Figure 4 Composite
+
+```{r figure4_composite, fig.width=7, fig.height=8.3}
+PRS_composite <- (PRS_AUC_Plot_modified | odds_ratio_plot) +
+  patchwork::plot_layout(guides = 'collect') & ggplot2::theme(legend.position = 'bottom')
+
+upset_finemapped
+PRS_AUC_Plot_modified
+odds_ratio_plot
+
+figure4 <- (credible_set_count_plot) / (upset_finemapped) / PRS_composite
+figure4 <- figure4 + plot_layout(height = c(1, 1.75, 1))
+figure4
+```
+
+
+# Supplementary Figures
+
+## Helper: Cell Type CRE Enrichment Plot
+
+```{r supp_helper}
+make_cell_type_supp_plot <- function(cell_CRE_data, cell_type_val, cell_type_val_lower) {
+  pct_category_val <- c('zscore_1', 'none', 'All')
+
+  cell_type_df <- cell_CRE_data %>%
+    dplyr::filter(cell_type %in% cell_type_val) %>%
+    dplyr::filter(pct_category %in% pct_category_val) %>%
+    dplyr::filter(!str_detect(Category, 'ATAC_H3K27ac_H3K4me3')) %>%
+    mutate(annotation = case_when(
+      str_detect(Category, 'enhancer_promoter_union_atac_500-all') ~ paste0(cell_type_val, '\nCRE+Enformer\n(All TF)'),
+      str_detect(Category, 'chrombpnet') ~ paste0(cell_type_val, '\nCRE+Enformer+ChromBPNet\n(', cell_type_val, ' TF)'),
+      str_detect(Category, paste0('enhancer_promoter_union_atac_500-', cell_type_val_lower)) ~ paste0(cell_type_val, '\nCRE+Enformer\n(', cell_type_val, ' TF)'),
+      str_detect(Category, 'enhancer_promoter_union_atac_500_1$') ~ paste0(cell_type_val, '\nCRE'),
+      str_detect(Category, 'enhancer_promoter_union_atac_500-none') ~ paste0(cell_type_val, '\nCRE')
+    )) %>%
+    mutate(annotation = factor(annotation, levels = c(
+      paste0(cell_type_val, '\nCRE'),
+      paste0(cell_type_val, '\nCRE+Enformer\n(All TF)'),
+      paste0(cell_type_val, '\nCRE+Enformer+ChromBPNet\n(', cell_type_val, ' TF)'),
+      paste0(cell_type_val, '\nCRE+Enformer\n(', cell_type_val, ' TF)')
+    )))
+
+  plot_prop_SNPs <- ggplot(cell_type_df, aes(x = gwas_name, y = Prop._SNPs, fill = annotation)) +
+    geom_bar(stat = "identity", position = position_dodge()) + coord_flip() +
+    xlab("GWAS") + ylab('Proportion of SNPs in Annotation') + labs(fill = "Annotation") +
+    scale_fill_npg() + theme_nature() + theme(legend.position = "none")
+
+  plot_prop_h2 <- ggplot(cell_type_df, aes(x = gwas_name, y = Prop._h2, fill = annotation)) +
+    geom_bar(stat = "identity", position = position_dodge()) +
+    geom_errorbar(aes(ymin = h2_CI_low, ymax = h2_CI_high), width = .2, position = position_dodge(.9)) +
+    coord_flip() + xlab(NULL) + ylab('Proportion of Heritability') + labs(fill = "Annotation") +
+    scale_fill_npg() + theme_nature() +
+    theme(axis.text.y = element_blank(), axis.title.y = element_blank(), legend.position = "none")
+
+  plot_enrichment <- ggplot(cell_type_df, aes(x = gwas_name, y = Enrichment, fill = annotation)) +
+    geom_bar(stat = "identity", position = position_dodge()) +
+    geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = .2, position = position_dodge(.9)) +
+    coord_flip() + xlab(NULL) + ylab('Enrichment of Heritability') + labs(fill = "Annotation") +
+    scale_fill_npg() + theme_nature() +
+    theme(axis.text.y = element_blank(), axis.title.y = element_blank())
+
+  (plot_prop_SNPs | plot_prop_h2 | plot_enrichment) +
+    plot_layout(guides = "collect") & theme(legend.position = "bottom")
+}
+```
+
+## Supplementary Figure 1: Microglia
+
+```{r supp_fig1, fig.width=7, fig.height=4}
+make_cell_type_supp_plot(cell_CRE_multgwas_ldsc, 'Microglia', 'microglia')
+```
+
+## Supplementary Figure 2: Astrocyte
+
+```{r supp_fig2, fig.width=7, fig.height=4}
+make_cell_type_supp_plot(cell_CRE_multgwas_ldsc, 'Astrocyte', 'astrocyte')
+```
+
+## Supplementary Figure 3: Neuron
+
+```{r supp_fig3, fig.width=7, fig.height=4}
+make_cell_type_supp_plot(cell_CRE_multgwas_ldsc, 'Neuron', 'neuron')
+```
+
+## Supplementary Figure 4: Oligodendrocyte
+
+```{r supp_fig4, fig.width=7, fig.height=4}
+make_cell_type_supp_plot(cell_CRE_multgwas_ldsc, 'Oligodendrocyte', 'oligodendrocyte')
+```
+
+## Helper: Cell Type ZS Enrichment Plot
+
+```{r supp_zs_helper}
+make_cell_type_zs_plot <- function(cell_CRE_data, cell_type_val, cell_type_val_lower, TF_filter_val) {
+  data_source_filter <- c('Glass Epigenomics', 'Enformer Tensorflow TF/Glass Epigenomics')
+  pct_category_val <- c('zscore_1', 'zscore_2', 'zscore_3', 'none', 'All')
+
+  cell_type_df <- cell_CRE_data %>%
+    dplyr::filter(data_source %in% data_source_filter) %>%
+    dplyr::filter(cell_type %in% cell_type_val) %>%
+    dplyr::filter(TF %in% TF_filter_val) %>%
+    dplyr::filter(pct_category %in% pct_category_val) %>%
+    mutate(annotation = case_when(
+      pct_category == 'zscore_1' ~ paste0(cell_type_val, '\nCRE+Enformer\n(ZS1)'),
+      pct_category == 'zscore_2' ~ paste0(cell_type_val, '\nCRE+Enformer\n(ZS2)'),
+      pct_category == 'zscore_3' ~ paste0(cell_type_val, '\nCRE+Enformer\n(ZS3)'),
+      pct_category == 'none' ~ paste0(cell_type_val, '\nCRE'),
+      pct_category == 'All' ~ paste0(cell_type_val, '\nCRE')
+    )) %>%
+    mutate(annotation = factor(annotation, levels = c(
+      paste0(cell_type_val, '\nCRE'),
+      paste0(cell_type_val, '\nCRE+Enformer\n(ZS1)'),
+      paste0(cell_type_val, '\nCRE+Enformer\n(ZS2)'),
+      paste0(cell_type_val, '\nCRE+Enformer\n(ZS3)')
+    )))
+
+  plot_prop_SNPs <- ggplot(cell_type_df, aes(x = gwas_name, y = Prop._SNPs, fill = annotation)) +
+    geom_bar(stat = "identity", position = position_dodge()) + coord_flip() +
+    xlab("GWAS") + ylab('Proportion of SNPs in Annotation') + labs(fill = "Annotation") +
+    scale_fill_npg() + theme_nature() + theme(legend.position = "none")
+
+  plot_prop_h2 <- ggplot(cell_type_df, aes(x = gwas_name, y = Prop._h2, fill = annotation)) +
+    geom_bar(stat = "identity", position = position_dodge()) +
+    geom_errorbar(aes(ymin = h2_CI_low, ymax = h2_CI_high), width = .2, position = position_dodge(.9)) +
+    coord_flip() + xlab(NULL) + ylab('Proportion of Heritability') + labs(fill = "Annotation") +
+    scale_fill_npg() + theme_nature() +
+    theme(axis.text.y = element_blank(), axis.title.y = element_blank(), legend.position = "none")
+
+  plot_enrichment <- ggplot(cell_type_df, aes(x = gwas_name, y = Enrichment, fill = annotation)) +
+    geom_bar(stat = "identity", position = position_dodge()) +
+    geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = .2, position = position_dodge(.9)) +
+    coord_flip() + xlab(NULL) + ylab('Enrichment of Heritability') + labs(fill = "Annotation") +
+    scale_fill_npg() + theme_nature() +
+    theme(axis.text.y = element_blank(), axis.title.y = element_blank())
+
+  (plot_prop_SNPs | plot_prop_h2 | plot_enrichment) +
+    plot_layout(guides = "collect") & theme(legend.position = "bottom")
+}
+```
+
+## Supplementary Figure 5: Microglia ZS Enrichment
+
+```{r supp_fig5, fig.width=7, fig.height=4}
+make_cell_type_zs_plot(cell_CRE_multgwas_ldsc, 'Microglia', 'microglia', c('microglia', 'none'))
+```
+
+## Supplementary Figure 6: Astrocyte ZS Enrichment
+
+```{r supp_fig6, fig.width=7, fig.height=4}
+make_cell_type_zs_plot(cell_CRE_multgwas_ldsc, 'Astrocyte', 'astrocyte', c('astrocyte', 'none'))
+```
+
+## Supplementary Figure 7: Neuron ZS Enrichment
+
+```{r supp_fig7, fig.width=7, fig.height=4}
+make_cell_type_zs_plot(cell_CRE_multgwas_ldsc, 'Neuron', 'neuron', c('neuron', 'none'))
+```
+
+## Supplementary Figure 8: Oligodendrocyte ZS Enrichment
+
+```{r supp_fig8, fig.width=7, fig.height=4}
+make_cell_type_zs_plot(cell_CRE_multgwas_ldsc, 'Oligodendrocyte', 'oligodendrocyte', c('oligodendrocyte', 'none'))
+```
+
+## Credible Set Summary Statistics (Auxiliary)
+
+```{r cs_summary_stats}
+omics_finemap_singleton_filtered <- finemapped_combined_singleton %>%
+  filter(fine_mapping_type == 'Baseline/Omics') %>% filter(P < 0.05)
+omics_finemap_CS_top_filtered <- finemapped_combined_CS %>%
+  filter(fine_mapping_type == 'Baseline/Omics') %>%
+  group_by(CREDIBLE_SET) %>% slice_max(PIP, n = 1) %>% ungroup() %>% filter(P < 0.05)
+
+omics_dl_finemap_singleton_filtered <- finemapped_combined_singleton %>%
+  filter(fine_mapping_type == 'Baseline/Omics/DL') %>% filter(P < 0.05)
+omics_dl_finemap_CS_top_filtered <- finemapped_combined_CS %>%
+  filter(fine_mapping_type == 'Baseline/Omics/DL') %>%
+  group_by(CREDIBLE_SET) %>% slice_max(PIP, n = 1) %>% ungroup() %>% filter(P < 0.05)
+
+susie_finemap_singleton_filtered <- finemapped_combined_singleton %>%
+  filter(fine_mapping_type == 'SUSIE') %>% filter(P < 0.05)
+susie_finemap_CS_top_filtered <- finemapped_combined_CS %>%
+  filter(fine_mapping_type == 'SUSIE') %>%
+  group_by(CREDIBLE_SET) %>% slice_max(PIP, n = 1) %>% ungroup() %>% filter(P < 0.05)
+
+baseline_finemap_singleton_filtered <- finemapped_combined_singleton %>%
+  filter(fine_mapping_type == 'Baseline') %>% filter(P < 0.05)
+baseline_finemap_CS_top_filtered <- finemapped_combined_CS %>%
+  filter(fine_mapping_type == 'Baseline') %>%
+  group_by(CREDIBLE_SET) %>% slice_max(PIP, n = 1) %>% ungroup() %>% filter(P < 0.05)
+
+finemapped_combined_CS_filtered <- bind_rows(susie_finemap_CS_top_filtered,
+                                              baseline_finemap_CS_top_filtered,
+                                              omics_finemap_CS_top_filtered,
+                                              omics_dl_finemap_CS_top_filtered)
+
+finemapped_combined_singleton_filtered <- bind_rows(susie_finemap_singleton_filtered,
+                                                     baseline_finemap_singleton_filtered,
+                                                     omics_finemap_singleton_filtered,
+                                                     omics_dl_finemap_singleton_filtered)
+
+num_CS_all <- finemapped_combined_CS_filtered %>%
+  group_by(fine_mapping_type) %>% summarise(num_cs = n()) %>%
+  mutate(annotation = factor(fine_mapping_type, levels = c("SUSIE", "Baseline", "Baseline/Omics", "Baseline/Omics/DL")))
+
+num_singletons_all <- finemapped_combined_singleton_filtered %>%
+  group_by(fine_mapping_type) %>% summarise(num_cs = n()) %>%
+  mutate(annotation = factor(fine_mapping_type, levels = c("SUSIE", "Baseline", "Baseline/Omics", "Baseline/Omics/DL")))
+
+num_CS_size_plot <- ggplot(num_CS_all, aes(x = annotation, y = num_cs, fill = annotation)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  xlab('Finemapping Method') + scale_fill_manual(values = cohort_colors_vec) +
+  ylab('Total Number of CS') + guides(fill = guide_legend(title = "Annotations")) +
+  theme_nature()
+
+num_singleton_size_plot <- ggplot(num_singletons_all, aes(x = annotation, y = num_cs, fill = annotation)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  xlab('Finemapping Method') + scale_fill_manual(values = cohort_colors_vec) +
+  ylab('Total Number of Singleton Variants (PIP > 0.50)') + guides(fill = guide_legend(title = "Annotations")) +
+  theme_nature()
+
+num_CS_size_plot
+num_singleton_size_plot
+
+count_cs_singleton_all <- (num_CS_size_plot) / (num_singleton_size_plot) +
+  patchwork::plot_layout(guides = 'collect') & ggplot2::theme(legend.position = 'bottom')
+
+count_cs_singleton_all
+```
+
+## Mean Number of Variants in CS (Auxiliary)
+
+```{r cs_mean_size}
+count_mean_variant_size_credible_sets <- function(df, pip_thresholds) {
+  result <- lapply(pip_thresholds, function(threshold) {
+    filtered_df <- df[df$max_pip >= threshold & df$P_top_pip < 0.05, ]
+    counts <- filtered_df %>% group_by(fine_mapping_type) %>% summarise(mean_num_variants = mean(num_variants))
+    counts$PIP_threshold <- threshold
+    counts
+  })
+  do.call(rbind, result)
+}
+
+PIP_thresholds_supp <- c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)
+
+finemapped_combined_CS_top_PIP_P <- finemapped_combined_CS %>%
+  group_by(fine_mapping_type, CREDIBLE_SET) %>%
+  slice_max(PIP, n = 1, with_ties = FALSE) %>% ungroup() %>%
+  dplyr::select(fine_mapping_type, CREDIBLE_SET, P_top_pip = P)
+
+finemapped_CS_statistics_pvalues <- finemapped_combined_CS_top_PIP_P %>%
+  dplyr::select(CREDIBLE_SET, fine_mapping_type, P_top_pip) %>% unique()
+
+finemapped_CS_statistics <- finemapped_combined_CS %>%
+  group_by(CREDIBLE_SET, fine_mapping_type) %>%
+  summarise(num_variants = n(), max_pip = max(PIP)) %>% ungroup() %>%
+  left_join(finemapped_CS_statistics_pvalues, by = c('CREDIBLE_SET', 'fine_mapping_type'))
+
+mean_CS_size <- count_mean_variant_size_credible_sets(finemapped_CS_statistics, PIP_thresholds_supp) %>%
+  mutate(PIP_threshold = as.factor(PIP_threshold))
+
+mean_CS_size$fine_mapping_type <- factor(mean_CS_size$fine_mapping_type,
+  levels = c('SUSIE', 'Baseline', 'Baseline/Omics', 'Baseline/Omics/DL'))
+
+mean_CS_size_plot <- ggplot(mean_CS_size, aes(x = PIP_threshold, y = mean_num_variants, fill = fine_mapping_type)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  xlab('All CS with\nMax PIP Above Threshold') +
+  scale_fill_manual(values = cohort_colors_vec) +
+  ylab('Mean Number of Variants per CS') +
+  guides(fill = guide_legend(title = "Annotations")) +
+  theme_nature()
+
+mean_CS_size_plot
+```
+
+## Supplementary Figure 9: CS Size Scatterplots
+
+```{r supp_fig9, fig.width=5, fig.height=10}
+summary_finemapped_SNPs <- finemapped_combined_CS %>%
+  group_by(fine_mapping_type, CREDIBLE_SET) %>%
+  summarise(num_variants = n(), max_PIP = max(PIP)) %>%
+  ungroup() %>%
+  dplyr::filter(max_PIP > 0.10)
+
+summary_finemapped_SNPs_loci <- summary_finemapped_SNPs %>%
+  tidyr::separate(CREDIBLE_SET, into = c('chr', 'bp_range', 'idx'), sep = ':') %>%
+  mutate(locus = paste0(chr, ':', bp_range)) %>%
+  dplyr::select(-idx, -bp_range, -chr) %>%
+  group_by(fine_mapping_type, locus) %>%
+  mutate(rank_val = rank(-max_PIP, ties.method = "random"))
+
+zz1_susie <- summary_finemapped_SNPs_loci %>%
+  dplyr::filter(fine_mapping_type == 'SUSIE') %>%
+  dplyr::rename(num_variants_susie = num_variants)
+
+zz1_baseline <- summary_finemapped_SNPs_loci %>%
+  dplyr::filter(fine_mapping_type == 'Baseline') %>%
+  dplyr::rename(num_variants_baseline = num_variants)
+
+zz1_baseline_omics <- summary_finemapped_SNPs_loci %>%
+  dplyr::filter(fine_mapping_type == 'Baseline/Omics') %>%
+  dplyr::rename(num_variants_baseline_omics = num_variants)
+
+zz1_baseline_omics_dl <- summary_finemapped_SNPs_loci %>%
+  dplyr::filter(fine_mapping_type == 'Baseline/Omics/DL') %>%
+  dplyr::rename(num_variants_baseline_omics_dl = num_variants)
+
+z_susie_vs_dl <- zz1_baseline_omics_dl %>%
+  inner_join(zz1_susie, by = c('locus', 'rank_val')) %>%
+  mutate(dl = case_when(
+    num_variants_baseline_omics_dl == num_variants_susie ~ 'TIED',
+    num_variants_baseline_omics_dl > num_variants_susie ~ 'DL',
+    num_variants_baseline_omics_dl < num_variants_susie ~ 'SUSIE'
+  ))
+
+z_baseline_vs_dl <- zz1_baseline_omics_dl %>%
+  inner_join(zz1_baseline, by = c('locus', 'rank_val')) %>%
+  mutate(dl = case_when(
+    num_variants_baseline_omics_dl == num_variants_baseline ~ 'TIED',
+    num_variants_baseline_omics_dl > num_variants_baseline ~ 'DL',
+    num_variants_baseline_omics_dl < num_variants_baseline ~ 'Baseline'
+  ))
+
+z_baseline_omics_vs_dl <- zz1_baseline_omics_dl %>%
+  inner_join(zz1_baseline_omics, by = c('locus', 'rank_val')) %>%
+  mutate(dl = case_when(
+    num_variants_baseline_omics_dl == num_variants_baseline_omics ~ 'TIED',
+    num_variants_baseline_omics_dl > num_variants_baseline_omics ~ 'DL',
+    num_variants_baseline_omics_dl < num_variants_baseline_omics ~ 'Omics'
+  ))
+
+z_susie_vs_dl %>% group_by(dl) %>% tally()
+z_baseline_vs_dl %>% group_by(dl) %>% tally()
+z_baseline_omics_vs_dl %>% group_by(dl) %>% tally()
+
+p1_susie_vs_dl <- ggplot(z_susie_vs_dl, aes(y = num_variants_susie, x = num_variants_baseline_omics_dl)) +
+  geom_point() + geom_abline(slope = 1, intercept = 0) + theme_nature() +
+  ylab('Number of Variants in CS (SuSiE)') +
+  xlab('Number of Variants in CS (Baseline+Omics+DL)') +
+  xlim(0, 60) + ylim(0, 60)
+
+p2_baseline_vs_dl <- ggplot(z_baseline_vs_dl, aes(y = num_variants_baseline, x = num_variants_baseline_omics_dl)) +
+  geom_point() + geom_abline(slope = 1, intercept = 0) + theme_nature() +
+  ylab('Number of Variants in CS (Baseline)') +
+  xlab('Number of Variants in CS (Baseline+Omics+DL)') +
+  xlim(0, 60) + ylim(0, 60)
+
+p3_omics_vs_dl <- ggplot(z_baseline_omics_vs_dl, aes(y = num_variants_baseline_omics, x = num_variants_baseline_omics_dl)) +
+  geom_point() + geom_abline(slope = 1, intercept = 0) + theme_nature() +
+  ylab('Number of Variants in CS (Baseline+Omics)') +
+  xlab('Number of Variants in CS (Baseline+Omics+DL)') +
+  xlim(0, 60) + ylim(0, 60)
+
+p1_susie_vs_dl
+p2_baseline_vs_dl
+p3_omics_vs_dl
+
+p4_combined_all_methods <- (p1_susie_vs_dl / p2_baseline_vs_dl / p3_omics_vs_dl) +
+  plot_annotation(title = 'Comparison of the Number of Variants in Matched CS') +
+  theme_nature()
+
+p4_combined_all_methods
+```
+
+## Supplementary Figure 10: Finemapped Variant Overlap
+
+```{r supp_fig10}
+finemapped_single_variants_PIP_50_long <- bind_rows(
+  finemapped_combined_CS %>% filter(PIP > 0.50 & P < 0.05),
+  finemapped_combined_singleton %>% filter(PIP > 0.50 & P < 0.05)
+) %>%
+  dplyr::select(SNP, fine_mapping_type) %>%
+  mutate(membership = TRUE)
+
+finemapped_single_variants_PIP_50_combined <- finemapped_single_variants_PIP_50_long %>%
+  pivot_wider(names_from = fine_mapping_type, values_from = membership, values_fill = FALSE)
+
+upset_annotation_names <- colnames(finemapped_single_variants_PIP_50_combined)[-1]
+
+overlap_finemapped_variants_upsetplot_complex <- ComplexUpset::upset(
+  finemapped_single_variants_PIP_50_combined,
+  upset_annotation_names,
+  min_size = 1,
+  name = 'Annotation Type',
+  queries = list(
+    upset_query(set = 'SUSIE', color = npg_colors[1], fill = npg_colors[1]),
+    upset_query(set = 'Baseline', color = npg_colors[2], fill = npg_colors[2]),
+    upset_query(set = 'Baseline/Omics', color = npg_colors[3], fill = npg_colors[3]),
+    upset_query(set = 'Baseline/Omics/DL', color = npg_colors[4], fill = npg_colors[4]),
+    upset_query(intersect = c('SUSIE'), color = npg_colors[1], fill = npg_colors[1],
+                only_components = c('intersections_matrix', 'Intersection size')),
+    upset_query(intersect = c('Baseline'), color = npg_colors[2], fill = npg_colors[2],
+                only_components = c('intersections_matrix', 'Intersection size')),
+    upset_query(intersect = c('Baseline/Omics'), color = npg_colors[3], fill = npg_colors[3],
+                only_components = c('intersections_matrix', 'Intersection size')),
+    upset_query(intersect = c('Baseline/Omics/DL'), color = npg_colors[4], fill = npg_colors[4],
+                only_components = c('intersections_matrix', 'Intersection size'))
+  )
+) + theme_nature()
+
+overlap_finemapped_variants_upsetplot_complex
+```
+
+## Supplementary Figures 11-15: PRS by Ancestry
+
+```{r supp_prs_setup}
+summary_SNPS_all_plot <- summary_SNPS %>%
+  mutate(annotation = case_when(
+    cohort == 'bellenguez_susie' ~ 'SUSIE',
+    cohort == 'bellenguez_baseline' ~ 'Baseline',
+    cohort == 'bellenguez_omics' ~ 'Baseline/Omics',
+    cohort == 'bellenguez_omics_dl' ~ 'Baseline/Omics/DL'
+  )) %>%
+  mutate(annotation = factor(annotation, levels = c("SUSIE", "Baseline", "Baseline/Omics", "Baseline/Omics/DL")))
+```
+
+## Supplementary Figure 11: PRS AUC - African American Ancestry
+
+```{r supp_fig11, fig.width=7, fig.height=5}
+PRS_african_american_plot <- ggplot(summary_SNPS_all_plot %>% filter(predicted_ancestry == 'AFR'),
+  aes(x = auc, y = threshold, color = annotation)) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  geom_errorbarh(aes(xmin = auc_low, xmax = auc_high), position = position_dodge(width = 0.5), height = 0.2) +
+  scale_y_discrete(limits = rev(levels(summary_SNPS$threshold))) +
+  scale_color_manual(values = cohort_colors_vec) +
+  theme_nature() + labs(x = "AUC", y = "Threshold", color = "Annotation") +
+  theme(legend.position = "bottom") + ggtitle('African American Ancestry') + xlim(0.40, 0.65)
+
+PRS_african_american_plot
+```
+
+## Supplementary Figure 12: PRS AUC - Hispanic Ancestry
+
+```{r supp_fig12, fig.width=7, fig.height=5}
+PRS_hispanic_plot <- ggplot(summary_SNPS_all_plot %>% filter(predicted_ancestry == 'AMR'),
+  aes(x = auc, y = threshold, color = annotation)) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  geom_errorbarh(aes(xmin = auc_low, xmax = auc_high), position = position_dodge(width = 0.5), height = 0.2) +
+  scale_y_discrete(limits = rev(levels(summary_SNPS$threshold))) +
+  scale_color_manual(values = cohort_colors_vec) +
+  theme_nature() + labs(x = "AUC", y = "Threshold", color = "Annotation") +
+  theme(legend.position = "bottom") + ggtitle('Hispanic Ancestry') + xlim(0.40, 0.65)
+
+PRS_hispanic_plot
+```
+
+## Supplementary Figure 13: PRS AUC - European Ancestry
+
+```{r supp_fig13, fig.width=7, fig.height=5}
+PRS_european_plot <- ggplot(summary_SNPS_all_plot %>% filter(predicted_ancestry == 'EUR'),
+  aes(x = auc, y = threshold, color = annotation)) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  geom_errorbarh(aes(xmin = auc_low, xmax = auc_high), position = position_dodge(width = 0.5), height = 0.2) +
+  scale_y_discrete(limits = rev(levels(summary_SNPS$threshold))) +
+  scale_color_manual(values = cohort_colors_vec) +
+  theme_nature() + labs(x = "AUC", y = "Threshold", color = "Annotation") +
+  theme(legend.position = "bottom") + ggtitle('European Ancestry') + xlim(0.40, 0.65)
+
+PRS_european_plot
+```
+
+## Supplementary Figure 14: PRS AUC - East Asian Ancestry
+
+```{r supp_fig14, fig.width=7, fig.height=5}
+PRS_east_asian_plot <- ggplot(summary_SNPS_all_plot %>% filter(predicted_ancestry == 'EAS'),
+  aes(x = auc, y = threshold, color = annotation)) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  geom_errorbarh(aes(xmin = auc_low, xmax = auc_high), position = position_dodge(width = 0.5), height = 0.2) +
+  scale_y_discrete(limits = rev(levels(summary_SNPS$threshold))) +
+  scale_color_manual(values = cohort_colors_vec) +
+  theme_nature() + labs(x = "AUC", y = "Threshold", color = "Annotation") +
+  theme(legend.position = "bottom") + ggtitle('East Asian Ancestry') + xlim(0.40, 0.65)
+
+PRS_east_asian_plot
+```
+
+## Supplementary Figure 15: PRS AUC - South Asian Ancestry
+
+```{r supp_fig15, fig.width=7, fig.height=5}
+PRS_south_asian_plot <- ggplot(summary_SNPS_all_plot %>% filter(predicted_ancestry == 'SAS'),
+  aes(x = auc, y = threshold, color = annotation)) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  geom_errorbarh(aes(xmin = auc_low, xmax = auc_high), position = position_dodge(width = 0.5), height = 0.2) +
+  scale_y_discrete(limits = rev(levels(summary_SNPS$threshold))) +
+  scale_color_manual(values = cohort_colors_vec) +
+  theme_nature() + labs(x = "AUC", y = "Threshold", color = "Annotation") +
+  theme(legend.position = "bottom") + ggtitle('South Asian Ancestry') + xlim(0.40, 0.65)
+
+PRS_south_asian_plot
+```
+
+## PRS Prevalence by Decile (All Ancestries)
+
+```{r prs_prevalence, fig.width=10, fig.height=6}
+prevalence_by_quintile <- prevalence_by_quintile %>%
+  mutate(annotation = factor(annotation, levels = c('SUSIE', 'BL', 'BL/Omics', 'BL/Omics/DL')))
+
+ggplot(prevalence_by_quintile, aes(x = score_quintile_factor, y = prevalence, fill = annotation)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~predicted_ancestry) +
+  scale_fill_npg() + theme_minimal() +
+  xlab('Decile') + ylab('Prevalence')
+```
